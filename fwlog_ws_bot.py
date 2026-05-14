@@ -3,15 +3,25 @@ import json
 import time
 import base64
 import os
+import re
 import sqlite3
+import shutil
+import subprocess
+import urllib.request as urlrequest
+import uuid
+import zlib
+import zipfile
+from io import BytesIO
+from urllib.parse import parse_qs, urlencode, urlparse
 from websockets.legacy.client import connect
+from xml.etree import ElementTree as ET
 
 # 配置区域：支持多个 Bot 实例
 BOT_CONFIGS = [
     {
         "name": "bot1",
-        "url": "ws://127.0.0.1:1234",
-        "token": "5G5456456"
+        "url": "ws://127.0.0.1:3001",
+        "token": "ghJqKVpnBCG51NL4"
     },
     # 示例：添加第二个 Bot
     # {
@@ -26,8 +36,33 @@ DB_FILE = os.path.join(os.path.dirname(__file__), "fwlog.db")
 
 WATCH_GROUPS = []
 
+DOWNLOAD_TIMEOUT_SEC = 180
+MAX_FILE_MB = 512
+MAX_FILE_BYTES = MAX_FILE_MB * 1024 * 1024
+RECENT_FILE_CAPTURE_TTL_SEC = 600
+PAINTER_SERVERS = [
+    "https://s02.trpgbot.com/s/",
+    "https://s03.trpgbot.com/models/",
+    "https://api.dice.center/dicelogger/",
+]
+KOKONA_BASE_URL = "https://dicelogger.s3-accelerate.amazonaws.com/"
+URL_RE = re.compile(r"https?://[^\s\]\"']+")
+ANGLE_SPEAKER_RE = re.compile(
+    r"^\s*[【\[]?\s*<(?P<name>[^>\n]+)>\s*[:：]\s*(?P<content>.*?)[】\]]?\s*$"
+)
+PLAIN_SPEAKER_RE = re.compile(
+    r"^\s*[【\[]?\s*(?P<name>[^:：<>\[\]【】\n][^:：<>\[\]【】\n]{0,79}?)\s*[:：]\s*(?P<content>.*?)[】\]]?\s*$"
+)
+recent_file_captures = {}
+
 def log(*args):
     print("[fwlog-bot]", *args)
+
+def safe_int(value, default=0):
+    try:
+        return int(value)
+    except Exception:
+        return default
 
 # Database handling
 def get_db_connection():
@@ -390,6 +425,773 @@ def segments_to_text(message):
         return "[空消息]"
     return "".join(parts)
 
+def safe_decode_bytes(data):
+    if not data:
+        return ""
+    for encoding in ["utf-8", "utf-8-sig", "gb18030", "gbk", "big5", "utf-16", "latin1"]:
+        try:
+            return data.decode(encoding)
+        except Exception:
+            continue
+    return data.decode("utf-8", errors="replace")
+
+def http_get_bytes(url, timeout=DOWNLOAD_TIMEOUT_SEC, headers=None):
+    request_headers = {
+        "User-Agent": "fwlog-bot/1.0",
+        "Connection": "close",
+    }
+    if headers:
+        request_headers.update(headers)
+
+    req = urlrequest.Request(url=url, headers=request_headers, method="GET")
+    total = 0
+    chunks = []
+    with urlrequest.urlopen(req, timeout=timeout) as resp:
+        while True:
+            buf = resp.read(1024 * 256)
+            if not buf:
+                break
+            total += len(buf)
+            if total > MAX_FILE_BYTES:
+                raise RuntimeError(f"文件过大，超过 {MAX_FILE_MB}MB 上限")
+            chunks.append(buf)
+    return b"".join(chunks)
+
+def http_get_json(url, timeout=DOWNLOAD_TIMEOUT_SEC, headers=None):
+    return json.loads(safe_decode_bytes(http_get_bytes(url, timeout=timeout, headers=headers)))
+
+def cleanup_recent_file_captures(now=None):
+    now = now or time.time()
+    expired = [key for key, ttl in recent_file_captures.items() if ttl <= now]
+    for key in expired:
+        recent_file_captures.pop(key, None)
+
+def remember_file_capture(session_id, log_name, file_key):
+    if not file_key:
+        return True
+    now = time.time()
+    cleanup_recent_file_captures(now)
+    cache_key = (session_id, log_name, str(file_key))
+    if recent_file_captures.get(cache_key, 0) > now:
+        return False
+    recent_file_captures[cache_key] = now + RECENT_FILE_CAPTURE_TTL_SEC
+    return True
+
+def get_event_target(event):
+    msg_type = event.get("message_type")
+    if msg_type == "group":
+        return "group", str(event.get("group_id"))
+    if msg_type == "private":
+        return "private", str(event.get("user_id"))
+
+    if (
+        str(event.get("post_type") or "").lower() == "notice"
+        and str(event.get("notice_type") or "").lower() == "group_upload"
+        and event.get("group_id") is not None
+    ):
+        return "group", str(event.get("group_id"))
+
+    return None, None
+
+def get_event_sender(event):
+    sender = event.get("sender") or {}
+    user_id = str(sender.get("user_id") or event.get("user_id") or "")
+    nickname = sender.get("card") or sender.get("nickname") or (f"QQ:{user_id}" if user_id else "Unknown")
+    return nickname, user_id
+
+def make_log_item(nickname, im_userid, ts, message, raw_msg_id):
+    return {
+        "nickname": nickname or "Unknown",
+        "im_userid": str(im_userid or ""),
+        "time": safe_int(ts, int(time.time())),
+        "message": str(message or ""),
+        "raw_msg_id": str(raw_msg_id or ""),
+    }
+
+def looks_like_speaker_name(name):
+    candidate = str(name or "").strip()
+    if not candidate or len(candidate) > 80:
+        return False
+
+    lowered = candidate.lower()
+    if lowered.startswith("http") or "://" in candidate:
+        return False
+    if candidate.startswith("CQ:") or "/" in candidate or "\\" in candidate:
+        return False
+    if re.fullmatch(r"\d+", candidate):
+        return False
+    return True
+
+def match_speaker_line(line):
+    text = str(line or "").strip()
+    if not text:
+        return None
+
+    match = ANGLE_SPEAKER_RE.match(text)
+    if match:
+        return match.group("name").strip(), match.group("content").strip()
+
+    match = PLAIN_SPEAKER_RE.match(text)
+    if not match:
+        return None
+
+    name = match.group("name").strip()
+    if not looks_like_speaker_name(name):
+        return None
+
+    return name, match.group("content").strip()
+
+def parse_structured_text_to_items(text, fallback_name, fallback_user_id, ts, raw_msg_id):
+    normalized = str(text or "").replace("\r\n", "\n").replace("\r", "\n").strip("\n")
+    if not normalized.strip():
+        return []
+
+    parsed_items = []
+    prefix_lines = []
+    current_name = None
+    current_lines = []
+    structured_found = False
+    item_index = 0
+    base_raw_id = raw_msg_id or f"parsed-{safe_int(ts, int(time.time()))}"
+
+    def flush_current():
+        nonlocal item_index, current_name, current_lines
+        if current_name is None:
+            return
+        content = "\n".join(current_lines).strip("\n")
+        if content.strip():
+            parsed_items.append(
+                make_log_item(current_name, "", ts, content, f"{base_raw_id}#{item_index}")
+            )
+            item_index += 1
+        current_name = None
+        current_lines = []
+
+    for line in normalized.split("\n"):
+        matched = match_speaker_line(line)
+        if matched:
+            structured_found = True
+            flush_current()
+            current_name = matched[0]
+            current_lines = []
+            if matched[1]:
+                current_lines.append(matched[1])
+            continue
+
+        if current_name is None:
+            if line.strip():
+                prefix_lines.append(line)
+        else:
+            current_lines.append(line)
+
+    flush_current()
+
+    if structured_found:
+        prefix_text = "\n".join(prefix_lines).strip()
+        if prefix_text:
+            parsed_items.insert(
+                0,
+                make_log_item(fallback_name, fallback_user_id, ts, prefix_text, f"{base_raw_id}#preface"),
+            )
+        return parsed_items
+
+    return [make_log_item(fallback_name, fallback_user_id, ts, normalized.strip(), base_raw_id)]
+
+def parse_cq_params(segment_text):
+    params = {}
+    for part in str(segment_text or "").split(","):
+        if "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if key:
+            params[key] = value
+    return params
+
+def extract_file_payloads(event):
+    payloads = []
+    post_type = str(event.get("post_type") or "").lower()
+    notice_type = str(event.get("notice_type") or "").lower()
+
+    if post_type == "notice" and notice_type == "group_upload":
+        file_info = event.get("file") or {}
+        file_id = file_info.get("id") or file_info.get("file_id")
+        if file_id:
+            payloads.append(
+                {
+                    "group_id": str(event.get("group_id") or ""),
+                    "user_id": str(event.get("user_id") or ""),
+                    "file_id": str(file_id),
+                    "name": str(file_info.get("name") or file_info.get("file_name") or "未知文件"),
+                    "busid": safe_int(file_info.get("busid"), 0),
+                    "url": str(file_info.get("url") or ""),
+                }
+            )
+        return payloads
+
+    message = event.get("message")
+    if isinstance(message, list):
+        for seg in message:
+            if not isinstance(seg, dict) or str(seg.get("type") or "").lower() != "file":
+                continue
+            data = seg.get("data") or {}
+            file_id = data.get("id") or data.get("file_id")
+            if not file_id:
+                continue
+            payloads.append(
+                {
+                    "group_id": str(event.get("group_id") or ""),
+                    "user_id": str(event.get("user_id") or ""),
+                    "file_id": str(file_id),
+                    "name": str(data.get("name") or data.get("file") or "未知文件"),
+                    "busid": safe_int(data.get("busid"), 0),
+                    "url": str(data.get("url") or data.get("file_url") or ""),
+                }
+            )
+        return payloads
+
+    if isinstance(message, str) and "[CQ:file" in message:
+        idx = 0
+        while True:
+            start = message.find("[CQ:file", idx)
+            if start == -1:
+                break
+            end = message.find("]", start)
+            if end == -1:
+                break
+            segment = message[start + 1:end]
+            param_text = segment.split(",", 1)[1] if "," in segment else ""
+            params = parse_cq_params(param_text)
+            file_id = params.get("id") or params.get("file_id")
+            if file_id:
+                payloads.append(
+                    {
+                        "group_id": str(event.get("group_id") or ""),
+                        "user_id": str(event.get("user_id") or ""),
+                        "file_id": str(file_id),
+                        "name": str(params.get("name") or params.get("file") or "未知文件"),
+                        "busid": safe_int(params.get("busid"), 0),
+                        "url": str(params.get("url") or params.get("file_url") or ""),
+                    }
+                )
+            idx = end + 1
+
+    return payloads
+
+def decode_text_bytes(data):
+    return safe_decode_bytes(data)
+
+def extract_docx_text(data):
+    with zipfile.ZipFile(BytesIO(data)) as zf:
+        targets = []
+        for name in zf.namelist():
+            lowered = name.lower()
+            if not lowered.startswith("word/"):
+                continue
+            if any(part in lowered for part in ("document.xml", "header", "footer", "footnotes", "endnotes", "comments")):
+                targets.append(name)
+
+        texts = []
+        for path in targets:
+            raw = zf.read(path)
+            try:
+                root = ET.fromstring(raw)
+            except Exception:
+                continue
+            for node in root.iter():
+                if node.text and node.text.strip():
+                    texts.append(node.text.strip())
+    return "\n".join(texts)
+
+def _extract_pdf_text_with_python(data):
+    try:
+        from pypdf import PdfReader  # type: ignore
+
+        reader = PdfReader(BytesIO(data))
+        return "\n".join((page.extract_text() or "") for page in reader.pages)
+    except Exception:
+        pass
+
+    try:
+        import PyPDF2  # type: ignore
+
+        reader = PyPDF2.PdfReader(BytesIO(data))
+        return "\n".join((page.extract_text() or "") for page in reader.pages)
+    except Exception:
+        return None
+
+def _extract_pdf_text_with_command(data):
+    command = shutil.which("pdftotext")
+    if not command:
+        return None
+
+    input_path = os.path.join(os.path.dirname(__file__), f"fwlog_{uuid.uuid4().hex}.pdf")
+    output_path = os.path.join(os.path.dirname(__file__), f"fwlog_{uuid.uuid4().hex}.txt")
+    try:
+        with open(input_path, "wb") as fw:
+            fw.write(data)
+        subprocess.run([command, "-layout", input_path, output_path], check=True, timeout=DOWNLOAD_TIMEOUT_SEC)
+        with open(output_path, "rb") as fr:
+            return decode_text_bytes(fr.read())
+    except Exception:
+        return None
+    finally:
+        for path in (input_path, output_path):
+            try:
+                if os.path.exists(path):
+                    os.remove(path)
+            except Exception:
+                pass
+
+def extract_pdf_text(data):
+    text = _extract_pdf_text_with_python(data)
+    if text and text.strip():
+        return text
+
+    text = _extract_pdf_text_with_command(data)
+    if text and text.strip():
+        return text
+
+    raise RuntimeError("PDF解析失败：请安装 pypdf/PyPDF2 或系统命令 pdftotext")
+
+def extract_doc_text(data):
+    for command_name in ("antiword", "catdoc"):
+        command = shutil.which(command_name)
+        if not command:
+            continue
+
+        input_path = os.path.join(os.path.dirname(__file__), f"fwlog_{uuid.uuid4().hex}.doc")
+        try:
+            with open(input_path, "wb") as fw:
+                fw.write(data)
+            proc = subprocess.run(
+                [command, input_path],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=DOWNLOAD_TIMEOUT_SEC,
+                check=False,
+            )
+            output = proc.stdout.decode("utf-8", errors="replace")
+            if output.strip():
+                return output
+        except Exception:
+            continue
+        finally:
+            try:
+                if os.path.exists(input_path):
+                    os.remove(input_path)
+            except Exception:
+                pass
+
+    raise RuntimeError("DOC解析失败：请安装 antiword 或 catdoc")
+
+def extract_text_from_file(filename, data):
+    ext = os.path.splitext(str(filename or "").lower())[1]
+    if ext in (".txt", ".log", ".json", ".csv", ".md", ".xml", ".yaml", ".yml"):
+        return decode_text_bytes(data)
+    if ext == ".docx":
+        return extract_docx_text(data)
+    if ext == ".pdf":
+        return extract_pdf_text(data)
+    if ext == ".doc":
+        return extract_doc_text(data)
+    return decode_text_bytes(data)
+
+def fetch_weizaima(key, password=None):
+    params = {"key": key}
+    if password:
+        params["password"] = password
+    url = f"https://weizaima.com/dice/api/load_data?{urlencode(params)}"
+    payload = http_get_json(url, timeout=30)
+    compressed = payload.get("data")
+    if not compressed:
+        return None
+    raw = zlib.decompress(base64.b64decode(compressed)).decode("utf-8")
+    return json.loads(raw)
+
+def format_weizaima_text(log_obj):
+    if not log_obj:
+        return ""
+    items = log_obj.get("items", []) or ((log_obj.get("data") or {}).get("items") or [])
+    lines = []
+    for item in items:
+        message = str(item.get("message") or "")
+        if not message or "[CQ:image" in message:
+            continue
+        lines.append(f"{item.get('nickname', '?')}: {message}")
+    return "\n".join(lines)
+
+def fetch_trpgbot(full_id):
+    sid, log_id = str(full_id).split("-", 1)
+    base_url = PAINTER_SERVERS[int(sid)]
+    headers = {"Referer": "https://logpainter.trpgbot.com/"}
+    meta = http_get_json(
+        f"{base_url}logReader.php?m=metaData&id={log_id}&r=0.1",
+        timeout=20,
+        headers=headers,
+    )
+    download_url = meta.get("redirectDownloadUrl") or f"{base_url}logReader.php?m=rawData&id={log_id}"
+    return safe_decode_bytes(http_get_bytes(download_url, timeout=90, headers=headers))
+
+def fetch_kokona(s3_key):
+    return safe_decode_bytes(http_get_bytes(f"{KOKONA_BASE_URL}{s3_key}", timeout=60))
+
+def fetch_raw_url(url):
+    return safe_decode_bytes(http_get_bytes(url, timeout=120))
+
+def infer_source_by_key(key):
+    value = str(key or "")
+    if value.startswith("http://") or value.startswith("https://"):
+        return "raw_url"
+    if "-" in value and value.split("-", 1)[0].isdigit():
+        return "trpgbot"
+    if "_" in value or len(value) > 20:
+        return "kokona"
+    return "weizaima"
+
+def format_raw_text(raw_text):
+    if not raw_text:
+        return ""
+    clean = []
+    pattern = re.compile(r"<(.*?)>(.*)")
+    for line in str(raw_text).split("\n"):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        matched = pattern.search(stripped)
+        if matched:
+            clean.append(f"{matched.group(1)}: {matched.group(2).strip()}")
+        else:
+            clean.append(stripped)
+    return "\n".join(clean)
+
+def fetch_log_text_by_source(key, password=None, source=None):
+    resolved_source = source or infer_source_by_key(key)
+    if resolved_source == "kokona":
+        return format_raw_text(fetch_kokona(key))
+    if resolved_source == "trpgbot":
+        return format_raw_text(fetch_trpgbot(key))
+    if resolved_source == "raw_url":
+        return format_raw_text(fetch_raw_url(key))
+    return format_weizaima_text(fetch_weizaima(key, password))
+
+def parse_log_target_entry(raw):
+    value = str(raw or "").strip()
+    if not value:
+        return None
+
+    url_match = URL_RE.search(value)
+    if url_match:
+        value = url_match.group(0)
+
+    if "/bridge/content/" in value:
+        return {"key": value, "source": "raw_url", "password": ""}
+
+    parsed = urlparse(value)
+    query = parse_qs(parsed.query)
+    key = ""
+    source = ""
+    password = ""
+
+    if query.get("s3"):
+        key = query["s3"][0]
+        source = "kokona"
+    elif query.get("key"):
+        key = query["key"][0]
+        source = "weizaima"
+        if parsed.fragment:
+            password = parsed.fragment
+    elif parsed.fragment:
+        fragment_key = re.sub(r"[^a-zA-Z0-9-_]", "", parsed.fragment)
+        if fragment_key:
+            key = fragment_key
+            if "-" in key:
+                source = "trpgbot"
+    else:
+        key = value
+
+    if not key:
+        return None
+
+    if not source:
+        source = infer_source_by_key(key)
+
+    return {"key": key, "source": source, "password": password}
+
+async def extract_items_from_text_chunk(text, sender_name, sender_id, ts, raw_msg_id):
+    text = str(text or "")
+    if not text.strip():
+        return []
+
+    items = []
+    plain_parts = []
+    cursor = 0
+    url_index = 0
+
+    for match in URL_RE.finditer(text):
+        plain_parts.append(text[cursor:match.start()])
+        url = match.group(0)
+        target = parse_log_target_entry(url)
+        extracted_text = ""
+        if target:
+            try:
+                extracted_text = await asyncio.to_thread(
+                    fetch_log_text_by_source,
+                    target["key"],
+                    target.get("password", ""),
+                    target.get("source"),
+                )
+            except Exception as e:
+                log("日志链接提取失败", url, e)
+                extracted_text = ""
+
+        if extracted_text and extracted_text.strip():
+            plain_text = "".join(plain_parts).strip()
+            if plain_text:
+                items.extend(
+                    parse_structured_text_to_items(
+                        plain_text,
+                        sender_name,
+                        sender_id,
+                        ts,
+                        f"{raw_msg_id}:text:{url_index}",
+                    )
+                )
+            plain_parts = []
+            items.extend(
+                parse_structured_text_to_items(
+                    extracted_text,
+                    sender_name,
+                    sender_id,
+                    ts,
+                    f"{raw_msg_id}:url:{url_index}",
+                )
+            )
+            url_index += 1
+        else:
+            plain_parts.append(url)
+
+        cursor = match.end()
+
+    plain_parts.append(text[cursor:])
+    plain_text = "".join(plain_parts).strip()
+    if plain_text:
+        items.extend(
+            parse_structured_text_to_items(
+                plain_text,
+                sender_name,
+                sender_id,
+                ts,
+                f"{raw_msg_id}:text:tail",
+            )
+        )
+
+    return items
+
+async def extract_items_from_forward(client, forward_id):
+    response = await client.send_api("get_forward_msg", {"id": forward_id})
+    data = response.get("data")
+    if response.get("status") != "ok" or not data:
+        response = await client.send_api("get_forward_msg", {"message_id": forward_id})
+        data = response.get("data")
+    if response.get("status") != "ok" or not data:
+        return []
+
+    if isinstance(data, dict) and "messages" in data:
+        nodes = data["messages"]
+    elif isinstance(data, list):
+        nodes = data
+    else:
+        nodes = []
+
+    items = []
+    for index, node in enumerate(nodes):
+        if not isinstance(node, dict):
+            continue
+        sender = node.get("sender") or {}
+        sender_id = str(sender.get("user_id") or "")
+        sender_name = sender.get("nickname") or (f"QQ:{sender_id}" if sender_id else "Unknown")
+        ts = node.get("time") or int(time.time())
+        content = segments_to_text(node.get("message") or node.get("content") or "")
+        if not str(content or "").strip():
+            continue
+        raw_id = str(node.get("message_id") or f"forward:{forward_id}:{index}")
+        items.append(make_log_item(sender_name, sender_id, ts, content, raw_id))
+
+    return items
+
+async def resolve_group_file_url(client, group_id, file_id, busid):
+    response = await client.send_api(
+        "get_group_file_url",
+        {
+            "group_id": str(group_id),
+            "file_id": str(file_id),
+            "busid": safe_int(busid, 0),
+        },
+    )
+    data = response.get("data") or {}
+    return str(data.get("url") or "")
+
+async def extract_items_from_file_payload(client, payload, sender_name, sender_id, ts, raw_msg_id):
+    file_url = str(payload.get("url") or "")
+    if not file_url:
+        group_id = payload.get("group_id")
+        file_id = payload.get("file_id")
+        if group_id and file_id:
+            file_url = await resolve_group_file_url(client, group_id, file_id, payload.get("busid", 0))
+
+    if not file_url:
+        raise RuntimeError("未获取到文件下载地址")
+
+    file_bytes = await asyncio.to_thread(http_get_bytes, file_url)
+    extracted_text = await asyncio.to_thread(extract_text_from_file, payload.get("name") or "未知文件", file_bytes)
+    return parse_structured_text_to_items(extracted_text, sender_name, sender_id, ts, raw_msg_id)
+
+async def handle_recording_event(client, event):
+    reply_type, session_id = get_event_target(event)
+    if not session_id:
+        return
+
+    if WATCH_GROUPS and session_id not in WATCH_GROUPS:
+        return
+
+    group_state = ensure_group_state(session_id)
+    current_log_name = group_state.get("current_log_name") or ""
+    if not group_state.get("recording") or not current_log_name:
+        return
+
+    log_obj = ensure_log(session_id, current_log_name)
+    sender_name, sender_id = get_event_sender(event)
+    event_ts = safe_int(event.get("time"), int(time.time()))
+    items = []
+
+    post_type = str(event.get("post_type") or "").lower()
+    notice_type = str(event.get("notice_type") or "").lower()
+
+    if post_type == "notice" and notice_type == "group_upload":
+        for index, payload in enumerate(extract_file_payloads(event)):
+            file_key = payload.get("file_id") or payload.get("name") or f"notice-{index}"
+            if not remember_file_capture(session_id, current_log_name, file_key):
+                continue
+            try:
+                items.extend(
+                    await extract_items_from_file_payload(
+                        client,
+                        payload,
+                        sender_name,
+                        sender_id,
+                        event_ts,
+                        f"file:{file_key}",
+                    )
+                )
+            except Exception as e:
+                log(f"[{client.name}] 文档提取失败", payload.get("name"), e)
+    else:
+        message = event.get("message")
+        message_id = str(event.get("message_id") or f"event:{event_ts}")
+        if isinstance(message, list):
+            for index, seg in enumerate(message):
+                if not isinstance(seg, dict):
+                    continue
+                seg_type = str(seg.get("type") or "").lower()
+                data = seg.get("data") or {}
+                if seg_type == "text":
+                    items.extend(
+                        await extract_items_from_text_chunk(
+                            data.get("text") or "",
+                            sender_name,
+                            sender_id,
+                            event_ts,
+                            f"{message_id}:text:{index}",
+                        )
+                    )
+                elif seg_type == "forward":
+                    forward_id = data.get("id") or data.get("res_id") or data.get("message_id")
+                    if not forward_id:
+                        continue
+                    try:
+                        items.extend(await extract_items_from_forward(client, str(forward_id)))
+                    except Exception as e:
+                        log(f"[{client.name}] 获取转发消息异常", forward_id, e)
+                elif seg_type == "file":
+                    payloads = extract_file_payloads({
+                        "post_type": post_type,
+                        "message": [seg],
+                        "group_id": event.get("group_id"),
+                        "user_id": event.get("user_id"),
+                    })
+                    for payload in payloads:
+                        file_key = payload.get("file_id") or payload.get("name") or f"message-{index}"
+                        if not remember_file_capture(session_id, current_log_name, file_key):
+                            continue
+                        try:
+                            items.extend(
+                                await extract_items_from_file_payload(
+                                    client,
+                                    payload,
+                                    sender_name,
+                                    sender_id,
+                                    event_ts,
+                                    f"{message_id}:file:{file_key}",
+                                )
+                            )
+                        except Exception as e:
+                            log(f"[{client.name}] 文档提取失败", payload.get("name"), e)
+        else:
+            text = segments_to_text(message).strip()
+            if text:
+                forward_ids = extract_forward_ids_from_text(text)
+                for index, forward_id in enumerate(forward_ids):
+                    try:
+                        items.extend(await extract_items_from_forward(client, str(forward_id)))
+                    except Exception as e:
+                        log(f"[{client.name}] 获取转发消息异常", forward_id, e)
+
+                for payload in extract_file_payloads(event):
+                    file_key = payload.get("file_id") or payload.get("name")
+                    if not remember_file_capture(session_id, current_log_name, file_key):
+                        continue
+                    try:
+                        items.extend(
+                            await extract_items_from_file_payload(
+                                client,
+                                payload,
+                                sender_name,
+                                sender_id,
+                                event_ts,
+                                f"{message_id}:file:{file_key}",
+                            )
+                        )
+                    except Exception as e:
+                        log(f"[{client.name}] 文档提取失败", payload.get("name"), e)
+
+                cleaned_text = re.sub(r"\[CQ:(?:forward|file)[^\]]*\]", "", text).strip()
+                if cleaned_text:
+                    items.extend(
+                        await extract_items_from_text_chunk(
+                            cleaned_text,
+                            sender_name,
+                            sender_id,
+                            event_ts,
+                            f"{message_id}:text",
+                        )
+                    )
+
+    if not items:
+        return
+
+    old_count, new_count = add_log_items(log_obj["id"], items)
+    log(f"[{client.name}] 已追加 {len(items)} 条 fwlog 内容 (当前共 {new_count} 条)")
+
+    if reply_type and new_count // 1000 > old_count // 1000:
+        await client.send_msg(
+            reply_type,
+            session_id,
+            f"【系统提醒】 当前日志 {log_obj['name']} 已记录 {new_count} 条消息。\n"
+            "如果记录完毕，请记得发送 .fwlog end 结束记录。",
+        )
+
 next_echo_id = 1
 message_queue = asyncio.Queue()
 
@@ -492,8 +1294,12 @@ class BotClient:
                             
                         # Otherwise, queue it with client reference
                         if isinstance(data, dict):
-                             if data.get("post_type") == "message" and data.get("message_type") in ["group", "private"]:
-                                 message_queue.put_nowait((self, data))
+                            post_type = str(data.get("post_type") or "").lower()
+                            notice_type = str(data.get("notice_type") or "").lower()
+                            if post_type == "message" and data.get("message_type") in ["group", "private"]:
+                                message_queue.put_nowait((self, data))
+                            elif post_type == "notice" and notice_type == "group_upload":
+                                message_queue.put_nowait((self, data))
                         
             except Exception as e:
                 log(f"[{self.name}] WS 连接出错或关闭", e)
@@ -613,8 +1419,8 @@ async def handle_fwlog_command(client, event, text_override=None):
                 msg_type, session_id,
                 f"【新建日志】 {user_name} 已新建日志: {name}\n"
                 "------------------------------\n"
-                "* 记录已开启！请发送【合并转发】消息以提取内容。\n"
-                "// 说明：本工具仅将合并转发转化为海豹原始格式，用于补充缺失日志。\n"
+                "* 记录已开启！请发送【合并转发 / 日志链接 / 文档 / 零碎文字】以提取内容。\n"
+                "// 说明：本工具会将以上内容转化为海豹原始格式，用于补充缺失日志。\n"
                 "// 正常跑团请直接使用 .log 指令。",
             )
         elif sub == "on":
@@ -638,7 +1444,7 @@ async def handle_fwlog_command(client, event, text_override=None):
             await client.send_msg(
                 msg_type, session_id,
                 f"【继续记录】 {user_name} 已继续记录合并转发日志: {name}\n"
-                "请发送【合并转发】消息以提取内容。",
+                "请发送【合并转发 / 日志链接 / 文档 / 零碎文字】以提取内容。",
             )
         elif sub == "off":
             if not g["recording"]:
@@ -781,86 +1587,6 @@ async def handle_fwlog_command(client, event, text_override=None):
         # Optionally notify group
         # await client.send_group_msg(group_id, f"执行指令出错: {e}")
 
-async def handle_forward_message(client, event):
-    msg_type = event.get("message_type")
-    if msg_type == "group":
-        session_id = str(event.get("group_id"))
-    elif msg_type == "private":
-        session_id = str(event.get("user_id"))
-    else:
-        return
-
-    if WATCH_GROUPS and session_id not in WATCH_GROUPS:
-        return
-        
-    g = ensure_group_state(session_id)
-    if not g["recording"] or not g["current_log_name"]:
-        return
-
-    text = segments_to_text(event.get("message"))
-    forward_ids = extract_forward_ids_from_text(text)
-    
-    if not forward_ids:
-        return
-        
-    log(f"[{client.name}] 捕获到合并转发ID:", forward_ids, "来自:", session_id)
-    
-    log_obj = ensure_log(session_id, g["current_log_name"])
-    
-    for fid in forward_ids:
-        try:
-            resp = await client.send_api("get_forward_msg", {"id": fid})
-            data = resp.get("data")
-            if resp.get("status") != "ok" or not data:
-                log(f"[{client.name}] 使用 id 获取转发失败，尝试使用 message_id")
-                resp = await client.send_api("get_forward_msg", {"message_id": fid})
-                data = resp.get("data")
-            if resp.get("status") != "ok" or not data:
-                log(f"[{client.name}] 获取转发消息内容为空或失败:", fid)
-                continue
-            
-            nodes = []
-            if isinstance(data, dict) and "messages" in data:
-                nodes = data["messages"]
-            elif isinstance(data, list):
-                nodes = data
-                
-            new_items = []
-            for node in nodes:
-                if not isinstance(node, dict):
-                    continue
-                sender = node.get("sender") or {}
-                sender_id = str(sender.get("user_id") or "")
-                sender_name = sender.get("nickname") or (
-                    f"QQ:{sender_id}" if sender_id else "Unknown"
-                )
-                ts = node.get("time") or int(time.time())
-                content = segments_to_text(node.get("message") or node.get("content") or "")
-                
-                item = {
-                    "nickname": sender_name,
-                    "im_userid": sender_id,
-                    "time": ts,
-                    "message": content,
-                    "raw_msg_id": str(node.get("message_id", "")),
-                }
-                new_items.append(item)
-                
-            if new_items:
-                old_cnt, new_cnt = add_log_items(log_obj["id"], new_items)
-                log(f"[{client.name}] 已从转发 {fid} 中提取 {len(new_items)} 条消息 (当前共 {new_cnt} 条)")
-                
-                # Check 1000 threshold
-                if new_cnt // 1000 > old_cnt // 1000:
-                    await client.send_msg(
-                        msg_type, session_id,
-                        f"【系统提醒】 当前日志 {log_obj['name']} 已记录 {new_cnt} 条消息。\n"
-                        "如果记录完毕，请记得发送 .fwlog end 结束记录。"
-                    )
-
-        except Exception as e:
-            log(f"[{client.name}] 获取转发消息异常", fid, e)
-
 async def process_messages():
     """Consume messages from the queue asynchronously"""
     log("消息处理循环已启动")
@@ -888,7 +1614,7 @@ async def process_messages():
                 log(f"[{client.name}] 检测到 fwlog 指令:", text)
                 await handle_fwlog_command(client, msg, text_override=text)
             else:
-                await handle_forward_message(client, msg)
+                await handle_recording_event(client, msg)
         except Exception as e:
             log(f"处理消息时发生错误: {e}")
         finally:
