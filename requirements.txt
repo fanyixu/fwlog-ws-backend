@@ -1,1 +1,13 @@
+flask
+openai
+pillow
+pymupdf
+pypdf
+pypdf2
+pyautogui
+pygetwindow
+python-docx
+requests
+selenium
+urllib3
 websockets==10.4
