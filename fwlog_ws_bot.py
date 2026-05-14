@@ -40,6 +40,7 @@ DOWNLOAD_TIMEOUT_SEC = 180
 MAX_FILE_MB = 512
 MAX_FILE_BYTES = MAX_FILE_MB * 1024 * 1024
 RECENT_FILE_CAPTURE_TTL_SEC = 600
+RECENT_FILE_DEDUPE_WINDOW_SEC = 1
 PAINTER_SERVERS = [
     "https://s02.trpgbot.com/s/",
     "https://s03.trpgbot.com/models/",
@@ -48,11 +49,13 @@ PAINTER_SERVERS = [
 KOKONA_BASE_URL = "https://dicelogger.s3-accelerate.amazonaws.com/"
 URL_RE = re.compile(r"https?://[^\s\]\"']+")
 ANGLE_SPEAKER_RE = re.compile(
-    r"^\s*[【\[]?\s*<(?P<name>[^>\n]+)>\s*[:：]\s*(?P<content>.*?)[】\]]?\s*$"
+    r"^\s*<(?P<name>[^>\n]+)>\s*:\s*(?P<content>.*?)\s*$"
 )
 PLAIN_SPEAKER_RE = re.compile(
-    r"^\s*[【\[]?\s*(?P<name>[^:：<>\[\]【】\n][^:：<>\[\]【】\n]{0,79}?)\s*[:：]\s*(?P<content>.*?)[】\]]?\s*$"
+    r"^\s*(?P<name>[^:<>\[\]【】\n][^:<>\[\]【】\n]{0,79}?)\s*:\s*(?P<content>.*?)\s*$"
 )
+MULTILINE_ANGLE_OPEN_RE = re.compile(r"^\s*<\s*$")
+MULTILINE_ANGLE_CLOSE_RE = re.compile(r"^\s*>\s*:\s*(?P<content>.*?)\s*$")
 recent_file_captures = {}
 
 def log(*args):
@@ -462,19 +465,22 @@ def http_get_json(url, timeout=DOWNLOAD_TIMEOUT_SEC, headers=None):
 
 def cleanup_recent_file_captures(now=None):
     now = now or time.time()
-    expired = [key for key, ttl in recent_file_captures.items() if ttl <= now]
+    expired = [key for key, value in recent_file_captures.items() if value[1] <= now]
     for key in expired:
         recent_file_captures.pop(key, None)
 
-def remember_file_capture(session_id, log_name, file_key):
-    if not file_key:
-        return True
+def remember_file_capture(session_id, log_name, event_ts):
     now = time.time()
     cleanup_recent_file_captures(now)
-    cache_key = (session_id, log_name, str(file_key))
-    if recent_file_captures.get(cache_key, 0) > now:
-        return False
-    recent_file_captures[cache_key] = now + RECENT_FILE_CAPTURE_TTL_SEC
+    cache_key = (session_id, log_name, "file-upload-window")
+    current_event_ts = safe_int(event_ts, int(now))
+    previous = recent_file_captures.get(cache_key)
+    if previous:
+        previous_event_ts, _ = previous
+        if abs(current_event_ts - previous_event_ts) <= RECENT_FILE_DEDUPE_WINDOW_SEC:
+            return False
+
+    recent_file_captures[cache_key] = (current_event_ts, now + RECENT_FILE_CAPTURE_TTL_SEC)
     return True
 
 def get_event_target(event):
@@ -541,6 +547,34 @@ def match_speaker_line(line):
 
     return name, match.group("content").strip()
 
+def match_multiline_angle_speaker(lines, start_index):
+    if start_index >= len(lines):
+        return None
+
+    if not MULTILINE_ANGLE_OPEN_RE.match(str(lines[start_index] or "")):
+        return None
+
+    name_parts = []
+    index = start_index + 1
+    while index < len(lines):
+        text = str(lines[index] or "").strip()
+        close_match = MULTILINE_ANGLE_CLOSE_RE.match(text)
+        if close_match:
+            if not name_parts:
+                return None
+            name = " ".join(name_parts).strip()
+            if not looks_like_speaker_name(name):
+                return None
+            return name, close_match.group("content").strip(), index + 1
+
+        if not text or text.startswith("<"):
+            return None
+
+        name_parts.append(text)
+        index += 1
+
+    return None
+
 def parse_structured_text_to_items(text, fallback_name, fallback_user_id, ts, raw_msg_id):
     normalized = str(text or "").replace("\r\n", "\n").replace("\r", "\n").strip("\n")
     if not normalized.strip():
@@ -553,6 +587,7 @@ def parse_structured_text_to_items(text, fallback_name, fallback_user_id, ts, ra
     structured_found = False
     item_index = 0
     base_raw_id = raw_msg_id or f"parsed-{safe_int(ts, int(time.time()))}"
+    lines = normalized.split("\n")
 
     def flush_current():
         nonlocal item_index, current_name, current_lines
@@ -567,8 +602,17 @@ def parse_structured_text_to_items(text, fallback_name, fallback_user_id, ts, ra
         current_name = None
         current_lines = []
 
-    for line in normalized.split("\n"):
+    line_index = 0
+    while line_index < len(lines):
+        line = lines[line_index]
         matched = match_speaker_line(line)
+        next_index = line_index + 1
+        if not matched:
+            multiline_matched = match_multiline_angle_speaker(lines, line_index)
+            if multiline_matched:
+                matched = multiline_matched[0], multiline_matched[1]
+                next_index = multiline_matched[2]
+
         if matched:
             structured_found = True
             flush_current()
@@ -576,6 +620,7 @@ def parse_structured_text_to_items(text, fallback_name, fallback_user_id, ts, ra
             current_lines = []
             if matched[1]:
                 current_lines.append(matched[1])
+            line_index = next_index
             continue
 
         if current_name is None:
@@ -583,6 +628,8 @@ def parse_structured_text_to_items(text, fallback_name, fallback_user_id, ts, ra
                 prefix_lines.append(line)
         else:
             current_lines.append(line)
+
+        line_index += 1
 
     flush_current()
 
@@ -1071,8 +1118,7 @@ async def handle_recording_event(client, event):
 
     if post_type == "notice" and notice_type == "group_upload":
         for index, payload in enumerate(extract_file_payloads(event)):
-            file_key = payload.get("file_id") or payload.get("name") or f"notice-{index}"
-            if not remember_file_capture(session_id, current_log_name, file_key):
+            if not remember_file_capture(session_id, current_log_name, event_ts):
                 continue
             try:
                 items.extend(
@@ -1082,7 +1128,7 @@ async def handle_recording_event(client, event):
                         sender_name,
                         sender_id,
                         event_ts,
-                        f"file:{file_key}",
+                        f"file:{payload.get('file_id') or payload.get('name') or f'notice-{index}'}",
                     )
                 )
             except Exception as e:
@@ -1122,8 +1168,7 @@ async def handle_recording_event(client, event):
                         "user_id": event.get("user_id"),
                     })
                     for payload in payloads:
-                        file_key = payload.get("file_id") or payload.get("name") or f"message-{index}"
-                        if not remember_file_capture(session_id, current_log_name, file_key):
+                        if not remember_file_capture(session_id, current_log_name, event_ts):
                             continue
                         try:
                             items.extend(
@@ -1133,7 +1178,7 @@ async def handle_recording_event(client, event):
                                     sender_name,
                                     sender_id,
                                     event_ts,
-                                    f"{message_id}:file:{file_key}",
+                                    f"{message_id}:file:{payload.get('file_id') or payload.get('name') or f'message-{index}'}",
                                 )
                             )
                         except Exception as e:
@@ -1149,8 +1194,7 @@ async def handle_recording_event(client, event):
                         log(f"[{client.name}] 获取转发消息异常", forward_id, e)
 
                 for payload in extract_file_payloads(event):
-                    file_key = payload.get("file_id") or payload.get("name")
-                    if not remember_file_capture(session_id, current_log_name, file_key):
+                    if not remember_file_capture(session_id, current_log_name, event_ts):
                         continue
                     try:
                         items.extend(
@@ -1160,7 +1204,7 @@ async def handle_recording_event(client, event):
                                 sender_name,
                                 sender_id,
                                 event_ts,
-                                f"{message_id}:file:{file_key}",
+                                f"{message_id}:file:{payload.get('file_id') or payload.get('name')}",
                             )
                         )
                     except Exception as e:
@@ -1443,7 +1487,7 @@ async def handle_fwlog_command(client, event, text_override=None):
 
             await client.send_msg(
                 msg_type, session_id,
-                f"【继续记录】 {user_name} 已继续记录合并转发日志: {name}\n"
+                f"【继续记录】 {user_name} 已继续记录日志: {name}\n"
                 "请发送【合并转发 / 日志链接 / 文档 / 零碎文字】以提取内容。",
             )
         elif sub == "off":
@@ -1451,7 +1495,7 @@ async def handle_fwlog_command(client, event, text_override=None):
                 await client.send_msg(msg_type, session_id, "当前不在记录状态")
             else:
                 update_group_state(session_id, recording=0)
-                await client.send_msg(msg_type, session_id, "【暂停记录】 已暂停记录当前合并转发日志")
+                await client.send_msg(msg_type, session_id, "【暂停记录】 已暂停记录当前日志")
         elif sub == "end":
             name = name_arg or g["current_log_name"]
             log_obj = get_log_full(session_id, name)
@@ -1568,8 +1612,8 @@ async def handle_fwlog_command(client, event, text_override=None):
         else:
             help_lines = [
                 "【fwlog 聊天记录转海豹日志工具】",
-                "// 说明：本工具专用于将【合并转发】消息转换为海豹(SealDice)原生日志格式，以便在日志缺失时进行补充。",
-                "// 注意：仅解析合并转发内容，不记录实时消息。",
+                "// 说明：本工具会将【合并转发 / 日志链接 / 文档 / 零碎文字】提取并转换为海豹(SealDice)原生日志格式，以便在日志缺失时进行补充。",
+                "// 注意：记录开启后，会按收到顺序持续追加以上内容。",
                 "// 正常跑团请使用 .log 指令。",
                 "",
                 "【指令列表】",
